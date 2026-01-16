@@ -1,0 +1,391 @@
+name: Pull Request Automation Workflow
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run ESLint
+      id: eslint-run
+      run: |
+        npm run lint
+        ESLINT_EXIT_CODE=$?
+        if [ $ESLINT_EXIT_CODE -eq 0 ]; then
+          echo "ESLINT_STATUS=✅ No ESLint issues found" >> $GITHUB_ENV
+        else
+          echo "ESLINT_STATUS=⚠️ ESLint issues detected" >> $GITHUB_ENV
+        fi
+        exit $ESLINT_EXIT_CODE
+    
+    - name: Check Prettier formatting
+      id: prettier-check
+      run: |
+        npx prettier --check src/ > prettier_output.txt 2>&1
+        PRETTIER_EXIT_CODE=$?
+        if [ $PRETTIER_EXIT_CODE -eq 0 ]; then
+          echo "PRETTIER_STATUS=✅ Code formatting is correct" >> $GITHUB_ENV
+        else
+          echo "PRETTIER_STATUS=⚠️ Code formatting issues detected" >> $GITHUB_ENV
+        fi
+        cat prettier_output.txt >> $GITHUB_STEP_SUMMARY
+        exit $PRETTIER_EXIT_CODE
+    
+    - name: Post Code Quality Report
+      if: always()
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const fs = require('fs');
+          const eslintOutput = fs.readFileSync('.eslintrc.js', 'utf8');
+          const prettierOutput = fs.readFileSync('prettier_output.txt', 'utf8').trim();
+          
+          const report = `
+          ## 🔍 Code Quality Report
+          
+          ### ESLint Results
+          ${{ env.ESLINT_STATUS }}
+          
+          **ESLint Configuration:**
+          - Config file: .eslintrc.js
+          - Target: src/**/*.js
+          
+          ### Prettier Results
+          ${{ env.PRETTIER_STATUS }}
+          
+          **Prettier Check Output:**
+          \`\`\`
+          ${prettierOutput || 'No formatting issues detected'}
+          \`\`\`
+          
+          ### Summary
+          - **ESLint:** Static code analysis for JavaScript quality
+          - **Prettier:** Code formatting consistency checks
+          - **Status:** Code quality checks completed
+          `;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: report
+          });
+  
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run tests with coverage
+      id: test-run
+      run: |
+        npm run test:coverage
+        TEST_EXIT_CODE=$?
+        if [ $TEST_EXIT_CODE -eq 0 ]; then
+          echo "TEST_STATUS=✅ All tests passed" >> $GITHUB_ENV
+        else
+          echo "TEST_STATUS=❌ Test failures detected" >> $GITHUB_ENV
+        fi
+        exit $TEST_EXIT_CODE
+    
+    - name: Extract coverage summary
+      id: coverage-summary
+      run: |
+        if [ -f "coverage/coverage-summary.json" ]; then
+          echo "COVERAGE_EXISTS=true" >> $GITHUB_ENV
+          node -pe "const data = require('./coverage/coverage-summary.json'); 'TOTAL_LINES=' + data.total.lines.pct + '\\nTOTAL_FUNCTIONS=' + data.total.functions.pct + '\\nTOTAL_BRANCHES=' + data.total.branches.pct + '\\nTOTAL_STATEMENTS=' + data.total.statements.pct" >> $GITHUB_ENV
+        else
+          echo "COVERAGE_EXISTS=false" >> $GITHUB_ENV
+        fi
+    
+    - name: Upload coverage reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-reports
+        path: coverage/
+    
+    - name: Post Test Coverage Report
+      if: always()
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          let coverageReport = '\n## 🧪 Test Coverage Report\n\n';
+          
+          if (process.env.COVERAGE_EXISTS === 'true') {
+            const fs = require('fs');
+            try {
+              const coverageData = JSON.parse(fs.readFileSync('coverage/coverage-summary.json', 'utf8'));
+              coverageReport += `
+              ### Coverage Summary
+              
+              | Metric | Percentage | Status |
+              |--------|------------|--------|
+              | Lines | ${coverageData.total.lines.pct}% | ${coverageData.total.lines.pct >= 70 ? '✅' : '⚠️'} |
+              | Functions | ${coverageData.total.functions.pct}% | ${coverageData.total.functions.pct >= 70 ? '✅' : '⚠️'} |
+              | Branches | ${coverageData.total.branches.pct}% | ${coverageData.total.branches.pct >= 70 ? '✅' : '⚠️'} |
+              | Statements | ${coverageData.total.statements.pct}% | ${coverageData.total.statements.pct >= 70 ? '✅' : '⚠️'} |
+              
+              ### Test Results
+              ${process.env.TEST_STATUS}
+              
+              **Coverage Threshold:** 70% (minimum)
+              `;
+            } catch (error) {
+              coverageReport += '\n⚠️ Unable to parse coverage data\n';
+            }
+          } else {
+            coverageReport += '\n❌ Coverage data not available\n';
+          }
+          
+          coverageReport += '\n### Summary\n- **Test Runner:** Jest\n- **Coverage Tool:** Jest Coverage\n- **Artifacts:** Coverage reports uploaded\n';
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: coverageReport
+          });
+  
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run dependency vulnerability check
+      id: npm-audit
+      run: |
+        npm audit --audit-level=moderate > audit_output.txt 2>&1
+        AUDIT_EXIT_CODE=$?
+        
+        if [ $AUDIT_EXIT_CODE -eq 0 ]; then
+          echo "VULNERABILITY_STATUS=✅ No vulnerabilities found" >> $GITHUB_ENV
+          echo "AUDIT_SUMMARY=No security vulnerabilities detected in dependencies" >> $GITHUB_ENV
+        else
+          echo "VULNERABILITY_STATUS=⚠️ Security vulnerabilities detected" >> $GITHUB_ENV
+          echo "AUDIT_SUMMARY=Security vulnerabilities found in dependencies - see details below" >> $GITHUB_ENV
+        fi
+        
+        cat audit_output.txt >> $GITHUB_STEP_SUMMARY
+    
+    - name: Scan for secrets in code changes
+      id: secrets-scan
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+        base: ${{ github.event.repository.default_branch }}
+        head: HEAD
+        extra_args: --debug --only-verified
+    
+    - name: Post Security Scan Report
+      if: always()
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const fs = require('fs');
+          let auditOutput = '';
+          try {
+            auditOutput = fs.readFileSync('audit_output.txt', 'utf8').substring(0, 1000);
+          } catch (error) {
+            auditOutput = 'Audit output not available';
+          }
+          
+          const securityReport = `
+          ## 🔒 Security Scan Report
+          
+          ### Vulnerabilities Check
+          ${process.env.VULNERABILITY_STATUS}
+          
+          **Dependencies Analysis:**
+          ${process.env.AUDIT_SUMMARY}
+          
+          **NPM Audit Output:**
+          \`\`\`
+          ${auditOutput}
+          \`\`\`
+          
+          ### Secrets Detection
+          ✅ Code scan completed
+          
+          **Scanning for:**
+          - API keys and tokens
+          - Private keys
+          - Database credentials
+          - Cloud service credentials
+          
+          ### Summary
+          - **Dependency Scanner:** npm audit
+          - **Secrets Scanner:** TruffleHog
+          - **Security Status:** Security scan completed
+          `;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: securityReport
+          });
+  
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Validate application build
+      id: build-check
+      run: |
+        echo "🔧 Starting build validation..." >> $GITHUB_STEP_SUMMARY
+        
+        # Run build script
+        npm run build
+        BUILD_EXIT_CODE=$?
+        
+        if [ $BUILD_EXIT_CODE -eq 0 ]; then
+          echo "BUILD_STATUS=✅ Build successful" >> $GITHUB_ENV
+        else
+          echo "BUILD_STATUS=❌ Build failed" >> $GITHUB_ENV
+          exit $BUILD_EXIT_CODE
+        fi
+    
+    - name: Start application for health check
+      id: health-check
+      run: |
+        # Start the application in background
+        npm start &
+        APP_PID=$!
+        
+        # Wait for application to start
+        sleep 5
+        
+        # Run health check
+        npm run health-check
+        HEALTH_EXIT_CODE=$?
+        
+        # Clean up
+        kill $APP_PID 2>/dev/null || true
+        
+        if [ $HEALTH_EXIT_CODE -eq 0 ]; then
+          echo "HEALTH_STATUS=✅ Application health check passed" >> $GITHUB_ENV
+        else
+          echo "HEALTH_STATUS=❌ Application health check failed" >> $GITHUB_ENV
+        fi
+        
+        exit $HEALTH_EXIT_CODE
+    
+    - name: Create deployment preview
+      id: preview-info
+      run: |
+        PREVIEW_INFO='\n## 🚀 Deployment Preview\n\n'
+        PREVIEW_INFO+='### Build Artifacts\n'
+        PREVIEW_INFO+='- **Node.js Application:** Ready for deployment\n'
+        PREVIEW_INFO+='- **Build Status:** Successful\n'
+        PREVIEW_INFO+='- **Health Check:** Passed\n\n'
+        PREVIEW_INFO+='### Environment Configuration\n'
+        PREVIEW_INFO+='- **Node Version:** 18.x\n'
+        PREVIEW_INFO+='- **Dependencies:** All installed\n'
+        PREVIEW_INFO+='- **Port:** 3000 (default)\n\n'
+        
+        echo "PREVIEW_INFO<<EOF" >> $GITHUB_ENV
+        echo "$PREVIEW_INFO" >> $GITHUB_ENV
+        echo "EOF" >> $GITHUB_ENV
+    
+    - name: Upload build artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-artifacts
+        path: |
+          src/
+          package.json
+          package-lock.json
+    
+    - name: Post Build Validation Report
+      if: always()
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const buildReport = `
+          ## 🔧 Build Validation
+          
+          ### Build Results
+          ${process.env.BUILD_STATUS}
+          
+          ### Application Health
+          ${process.env.HEALTH_STATUS}
+          
+          ${process.env.PREVIEW_INFO || ''}
+          
+          ### Summary
+          - **Build Process:** Node.js application compilation
+          - **Health Check:** Endpoint validation
+          - **Deployment Preview:** Ready for deployment
+          - **Status:** Build validation completed
+          `;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: buildReport
+          });
